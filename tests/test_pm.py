@@ -1,0 +1,332 @@
+"""Tests for the Product Manager plugin — the skill library, the PM Brain tools (incl.
+provenance enforcement), the subagents, register() wiring, and the dashboard view routes.
+Host-free: needs only requirements-dev.txt."""
+
+from __future__ import annotations
+
+import sys
+import types
+from pathlib import Path
+
+import pytest
+from pm import brain  # via the synthetic package (conftest)
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+# ── the skill library ────────────────────────────────────────────────────────────
+
+
+def _skill_files():
+    return sorted((ROOT / "skills").glob("*/SKILL.md"))
+
+
+def _frontmatter(text: str) -> dict:
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    fm = {}
+    for line in text[3:end].splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip().strip('"')
+    return fm
+
+
+def test_skill_library_is_substantial_and_well_formed():
+    files = _skill_files()
+    assert len(files) >= 60, f"expected the full PM library, found {len(files)}"
+    names = []
+    for f in files:
+        fm = _frontmatter(f.read_text(encoding="utf-8"))
+        assert fm.get("name"), f"{f} missing name"
+        assert fm.get("description"), f"{f} missing description"
+        # dir name should match the frontmatter name (clean discovery)
+        assert fm["name"] == f.parent.name, f"{f}: name {fm['name']!r} != dir {f.parent.name!r}"
+        names.append(fm["name"])
+    assert len(names) == len(set(names)), "duplicate skill names"
+
+
+def test_no_claude_code_argument_token_leaked():
+    for f in _skill_files():
+        assert "$ARGUMENTS" not in f.read_text(encoding="utf-8"), f"{f} still has $ARGUMENTS"
+
+
+def test_redundant_variants_were_consolidated():
+    names = {f.parent.name for f in _skill_files()}
+    # the existing/new pairs are merged into single mode-aware skills
+    for merged in ("brainstorm-ideas", "identify-assumptions", "design-experiments"):
+        assert merged in names
+    for gone in (
+        "brainstorm-ideas-new",
+        "identify-assumptions-existing",
+        "brainstorm-experiments-new",
+    ):
+        assert gone not in names
+
+
+# ── manifest / version coherence ───────────────────────────────────────────────
+
+
+def test_manifest_and_pyproject_versions_match():
+    import tomllib
+
+    import yaml
+
+    m = yaml.safe_load((ROOT / "protoagent.plugin.yaml").read_text())
+    pp = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    assert m["version"] == pp["project"]["version"]
+    assert m["id"] == "pm" and m["config_section"] == "pm"
+    assert m["enabled"] is False  # ships disabled — enabling is the operator's call
+    assert m["views"][0]["path"] == "/plugins/pm/view"  # public, not /api
+
+
+# ── provenance enforcement (the audit spine) ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "claim  [x](../ingestion/interviews/2026-06-15-acme.md)",
+        "claim  [x](../source/meetings/2026-06-15-sync.md)",
+        "claim  (stakeholder-verbal, Naomi, 2026-06-15)",
+        "claim  (intuition, PM, 2026-06-15)",
+        "claim  (industry-knowledge)",
+        "claim  (chat, no artifact)",
+    ],
+)
+def test_provenance_accepts_every_tag_form(row):
+    assert brain._has_provenance(row)
+
+
+def test_provenance_rejects_untagged_and_prose_citation():
+    assert not brain._has_provenance("Acme said batches are unusable")
+    assert not brain._has_provenance(
+        "Acme reported X (Acme interview, 2026-04-22)"
+    )  # prose, not a link
+
+
+# ── the brain tools ─────────────────────────────────────────────────────────────
+
+
+def test_brain_init_scaffolds_and_is_idempotent():
+    out = brain.pm_brain_init.invoke({})
+    assert "ready" in out.lower()
+    root = brain._brain_root()
+    for f in (
+        "INDEX.md",
+        "operating-manual.md",
+        "decisions/_SCHEMA.md",
+        "hypotheses/_SCHEMA.md",
+        "stakeholders/_SCHEMA.md",
+        "knowledge/strategy.md",
+        "rules/prioritization.md",
+    ):
+        assert (root / f).exists(), f"missing {f}"
+    again = brain.pm_brain_init.invoke({})
+    assert "already initialized" in again
+
+
+def test_log_decision_rejects_orphan_evidence():
+    brain.pm_brain_init.invoke({})
+    out = brain.pm_log_decision.invoke(
+        {
+            "title": "Default to weekly batches",
+            "context": "Customers split on cadence.",
+            "evidence": ["Acme ops lead said weekly is unusable"],  # NO provenance tag
+        }
+    )
+    assert "Rejected" in out and "provenance" in out.lower()
+    assert not list((brain._brain_root() / "decisions").glob("2*.md"))  # nothing written
+
+
+def test_log_decision_writes_tagged_decision_and_shows_as_debt():
+    brain.pm_brain_init.invoke({})
+    out = brain.pm_log_decision.invoke(
+        {
+            "title": "Adopt weekly digest default",
+            "context": "Cadence fork.",
+            "status": "pending",
+            "evidence": [
+                "Three accounts asked for it  [x](../ingestion/interviews/2026-06-15-x.md)"
+            ],
+            "reverse_when": "If weekly opt-out exceeds 30% in 60 days.",
+        }
+    )
+    assert "Logged decision" in out
+    files = [
+        f for f in (brain._brain_root() / "decisions").glob("*.md") if not f.name.startswith("_")
+    ]
+    assert len(files) == 1
+    s = brain.brain_status()
+    assert len(s["decisions"]["pending"]) == 1
+    assert s["decisions"]["pending"][0]["title"].startswith("Decision: Adopt weekly")
+
+
+def test_stakeholder_upsert_touch_and_staleness(monkeypatch):
+    brain.pm_brain_init.invoke({})
+    brain.pm_upsert_stakeholder.invoke(
+        {"name": "Naomi Park", "role": "VP Eng", "influence": "high"}
+    )
+    s = brain.brain_status()
+    assert s["stakeholders"]["total"] == 1
+    assert len(s["stakeholders"]["stale"]) == 1  # never touched → stale
+    out = brain.pm_touch_stakeholder.invoke(
+        {"name": "Naomi Park", "summary": "Confirmed Q3 priority"}
+    )
+    assert "Logged touchpoint" in out
+    txt = (brain._brain_root() / "stakeholders" / "naomi-park.md").read_text()
+    assert "Confirmed Q3 priority" in txt and brain._today() in txt
+    s2 = brain.brain_status()
+    assert len(s2["stakeholders"]["stale"]) == 0  # touched today → current
+
+
+def test_ingest_writes_source_and_ingestion_with_citation():
+    brain.pm_brain_init.invoke({})
+    out = brain.pm_ingest.invoke(
+        {
+            "kind": "interviews",
+            "title": "Acme ops",
+            "synthesis": "Batch notifications unusable.",
+            "source_text": "JAMIE: we stopped acting on daily pings.",
+        }
+    )
+    assert "ingestion/interviews/" in out and "source:" in out
+    root = brain._brain_root()
+    assert list((root / "source" / "interviews").glob("*.md"))
+    assert list((root / "ingestion" / "interviews").glob("*.md"))
+
+
+def test_hypothesis_upsert_warns_on_orphan_evidence():
+    brain.pm_brain_init.invoke({})
+    body = (
+        "## Value risk\n### H-V1: users want this\n- Evidence for:\n  - they said so\n"  # untagged
+    )
+    out = brain.pm_upsert_hypothesis.invoke({"feature": "weekly-digest", "body": body})
+    assert "Saved hypotheses" in out and "missing a provenance tag" in out
+    assert (brain._brain_root() / "hypotheses" / "weekly-digest.md").exists()
+
+
+def test_list_get_search_and_traversal_guard():
+    brain.pm_brain_init.invoke({})
+    assert "INDEX.md" not in brain.pm_list.invoke({"area": "decisions"})  # decisions empty
+    got = brain.pm_get.invoke({"path": "INDEX.md"})
+    assert "Master Index" in got
+    assert "inside the PM Brain" in brain.pm_get.invoke({"path": "../../etc/passwd"})
+    brain.pm_note.invoke(
+        {"area": "strategy", "content": "North star = weekly active teams.", "title": "NSM"}
+    )
+    assert "weekly active teams" in brain.pm_search.invoke({"query": "weekly active"})
+
+
+# ── register() wiring ───────────────────────────────────────────────────────────
+
+
+def test_register_wires_tools_skills_subagents_and_two_routers(registry, monkeypatch):
+    import pm as pkg
+
+    # subagents need a host module; inject a minimal fake SubagentConfig.
+    fake = types.ModuleType("graph.subagents.config")
+
+    class SubagentConfig:
+        def __init__(self, name, description, system_prompt, tools=None, **kw):
+            self.name, self.description, self.system_prompt = name, description, system_prompt
+            self.tools = tools or []
+
+    fake.SubagentConfig = SubagentConfig
+    monkeypatch.setitem(sys.modules, "graph", types.ModuleType("graph"))
+    monkeypatch.setitem(sys.modules, "graph.subagents", types.ModuleType("graph.subagents"))
+    monkeypatch.setitem(sys.modules, "graph.subagents.config", fake)
+
+    pkg.register(registry)
+
+    assert len(registry.tools) == len(brain.BRAIN_TOOLS) == 11
+    assert registry.skill_dirs == ["skills"]
+    names = {s.name for s in registry.subagents}
+    assert names == {"pm_brain", "pm_discovery", "pm_strategy", "pm_execution", "pm_analytics"}
+    prefixes = [p for p, _ in registry.routers]
+    assert "/plugins/pm" in prefixes and "/api/plugins/pm" in prefixes
+
+
+def test_subagent_tool_allowlists_reference_real_tools(registry, monkeypatch):
+    """Every tool a subagent allowlists must be a real brain tool or a known host tool —
+    a typo'd name silently gives the subagent no access to it."""
+    import pm.subagents as sub
+
+    fake = types.ModuleType("graph.subagents.config")
+
+    class SubagentConfig:
+        def __init__(self, name, description, system_prompt, tools=None, **kw):
+            self.name, self.description, self.tools = name, description, tools or []
+
+    fake.SubagentConfig = SubagentConfig
+    monkeypatch.setitem(sys.modules, "graph", types.ModuleType("graph"))
+    monkeypatch.setitem(sys.modules, "graph.subagents", types.ModuleType("graph.subagents"))
+    monkeypatch.setitem(sys.modules, "graph.subagents.config", fake)
+
+    brain_names = {t.name for t in brain.BRAIN_TOOLS}
+    host_tools = {
+        "current_time",
+        "web_search",
+        "fetch_url",
+        "memory_recall",
+        "memory_list",
+        "memory_ingest",
+    }
+    for cfg in sub._configs():
+        for t in cfg.tools:
+            assert t in brain_names or t in host_tools, f"{cfg.name} references unknown tool {t!r}"
+
+
+# ── the view routes ──────────────────────────────────────────────────────────────
+
+
+def _app():
+    from fastapi import FastAPI
+    from pm import view
+
+    app = FastAPI()
+    app.include_router(view.build_view_router(), prefix="/plugins/pm")
+    app.include_router(view.build_data_router(), prefix="/api/plugins/pm")
+    return app
+
+
+def test_view_page_public_and_data_gated_prefix():
+    from fastapi.testclient import TestClient
+
+    c = TestClient(_app())
+    assert c.get("/plugins/pm/view").status_code == 200  # public page
+    assert c.get("/api/plugins/pm/view").status_code == 404  # not under /api
+    st = c.get("/api/plugins/pm/status").json()
+    assert "decisions" in st and st["exists"] is False  # no brain yet
+
+
+def test_view_status_and_file_routes_reflect_the_brain():
+    from fastapi.testclient import TestClient
+
+    brain.pm_brain_init.invoke({})
+    brain.pm_log_decision.invoke(
+        {
+            "title": "Ship it",
+            "context": "x",
+            "status": "pending",
+            "evidence": ["because  (intuition, PM, 2026-06-15)"],
+        }
+    )
+    c = TestClient(_app())
+    st = c.get("/api/plugins/pm/status").json()
+    assert st["exists"] is True and len(st["decisions"]["pending"]) == 1
+    f = c.get("/api/plugins/pm/file", params={"path": "INDEX.md"}).json()
+    assert "Master Index" in f["content"]
+    assert c.get("/api/plugins/pm/file", params={"path": "../../etc/passwd"}).status_code == 400
+
+
+def test_shell_page_is_four_rules_compliant():
+    from pm import view
+
+    html = view._SHELL_HTML
+    assert "/_ds/plugin-kit.css" in html and "/_ds/plugin-kit.js" in html
+    assert 'location.pathname.split("/plugins/")[0]' in html  # slug-aware base
+    assert 'apiFetch("/api/plugins/pm/status")' in html  # gated data via the kit
+    assert "kit.initPluginView" in html  # kit owns theming
+    assert ":root{" not in html[: html.index("</style>")]  # no hand-rolled theme

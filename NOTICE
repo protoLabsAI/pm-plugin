@@ -1,0 +1,24 @@
+pm-plugin (Product Manager plugin for protoAgent)
+Copyright (c) 2026 protoLabs AI — MIT License (see LICENSE)
+
+------------------------------------------------------------------------------
+Attribution
+------------------------------------------------------------------------------
+
+The product-management skill library and the "PM Brain" knowledge model in this
+plugin are adapted from Paweł Huryn's open-source work, used under the MIT License:
+
+  • pm-skills   — https://github.com/phuryn/pm-skills
+  • pm-brain    — https://github.com/phuryn/pm-brain
+    Copyright (c) 2026 Paweł Huryn — MIT License
+    https://www.productcompass.pm
+
+This plugin is an adaptation, not a verbatim copy: the nine separate Claude Code
+plugins are unified into one protoAgent plugin, redundant skill variants are
+consolidated, the skills are adapted to protoAgent's skill format, and the
+PM Brain is re-implemented as protoAgent tools + a console view (rather than a
+scaffolded directory of markdown). The frameworks, structure, and much of the
+skill prose originate with Paweł Huryn; errors introduced in adaptation are ours.
+
+The MIT License above covers this plugin; the upstream MIT terms are preserved
+for the adapted material per that license.

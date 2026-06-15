@@ -1,0 +1,31 @@
+id: pm
+name: Product Manager
+version: 0.1.0
+description: >-
+  A product-management toolkit for protoAgent: 65 PM skills (discovery, strategy, execution,
+  research, go-to-market, marketing/growth, analytics, AI-shipping, and PM utilities), a
+  markdown-native "PM Brain" knowledge base (decisions, hypotheses, stakeholders, knowledge,
+  with provenance-enforced evidence), five PM specialist subagents, and a brain dashboard.
+  Adapted from Paweł Huryn's pm-skills + pm-brain (MIT).
+enabled: false
+repository: https://github.com/protoLabsAI/pm-plugin
+min_protoagent_version: "0.34.0"
+
+# Config (ADR 0019) — defaults are the source of truth; editable in Settings ▸ Plugins.
+config_section: pm
+config:
+  brain_dir: ""              # where the PM Brain lives. Empty → ~/.protoagent/pm-brain
+                             # (instance-scoped). Point at a repo path to git-version it.
+  stale_stakeholder_days: 21 # a stakeholder not touched in this many days shows as "stale".
+settings:
+  - { key: brain_dir, label: "PM Brain directory", type: string, description: "Where the PM Brain markdown lives. Empty = the protoagent data dir (instance-scoped). Set to a repo path to keep the brain git-versioned." }
+  - { key: stale_stakeholder_days, label: "Stakeholder staleness (days)", type: number, description: "A stakeholder not touched within this many days is flagged stale on the dashboard." }
+
+# The PM Brain dashboard. Page is PUBLIC under /plugins/pm; data routes are gated under
+# /api/plugins/pm (plugin-view rules). Chrome is the DS plugin-kit (/_ds/, host >= 0.34.0).
+views:
+  - { id: pm_brain, label: "PM Brain", icon: BrainCircuit, placement: right, path: /plugins/pm/view }
+
+capabilities:
+  network: ["*"]             # skills use web search/fetch for market & competitive research
+  filesystem: scoped         # the PM Brain markdown under the configured brain directory
