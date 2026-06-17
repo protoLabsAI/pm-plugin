@@ -97,9 +97,20 @@ focused persona + tool allowlist.
 
 ## The dashboard
 
-A right-rail **PM Brain** view: decision debt (pending decisions), hypotheses by status, stale or
-never-touched stakeholders, recent ingestion, and area counts — click any item to read the file.
-Themed by the DS plugin-kit, so it follows the console's live theme.
+A right-rail **PM Brain** view, themed by the DS plugin-kit so it follows the console's live theme.
+Two surfaces in one panel:
+
+- **At-a-glance cards** — decision debt (pending decisions), hypotheses by status, stale or
+  never-touched stakeholders, recent ingestion, and area counts.
+- **Full file browser + editor** — an **All files** card listing *every* doc the brain produced,
+  grouped by area (not just the curated slices above). Click any file to read it; **Edit** opens an
+  inline editor and **Save** writes it back; **New file** creates one (pick an area + name). So a PM
+  can read and edit all brain docs without leaving the console. Two guardrails carry over from the
+  tools: `source/` files are verbatim audit anchors and stay **read-only**, and saving a decision or
+  hypothesis with an untagged evidence row **warns** (the human PM has final say — it still saves).
+
+Data flows through gated `/api/plugins/pm` routes (`/files`, `GET`/`PUT /file`), all traversal-guarded
+to the brain root.
 
 ## Configuration
 

@@ -260,6 +260,106 @@ def brain_status() -> dict:
     return out
 
 
+# ── file browser + edit (powers the dashboard's read/edit-all-docs surface) ──────
+# A human PM needs to see and edit every file the brain produced — not just the curated
+# slices the status sweep surfaces. These back the view's /files, /file, PUT /file routes.
+
+
+def _safe_target(path: str) -> Path | None:
+    """Resolve a brain-relative path, refusing anything that escapes the brain root."""
+    root = _brain_root()
+    target = (root / (path or "").strip().lstrip("/")).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+def _title_of(path: Path) -> str:
+    for line in _read(path).splitlines():
+        if line.strip():
+            return line.lstrip("# ").strip()
+    return path.stem
+
+
+def _decision_orphans(text: str) -> list[str]:
+    """Bullet rows under a decision's `## Evidence` / `## Explicitly NOT doing` that lack a
+    provenance tag — the same audit rule pm_log_decision enforces, applied to a hand edit."""
+    orphans, in_evidence = [], False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("## "):
+            head = s[3:].strip().lower()
+            in_evidence = head.startswith("evidence") or head.startswith("explicitly not")
+            continue
+        if in_evidence and s.startswith("-") and s.lstrip("-* ") and not _has_provenance(s):
+            orphans.append(s)
+    return orphans
+
+
+def file_warnings(rel_path: str, content: str) -> list[str]:
+    """Provenance warnings for an edited file (decisions/hypotheses only). Warn, don't block —
+    the human PM has final say; the audit signal stays visible."""
+    area = next(iter(Path(rel_path).parts), "")
+    if area == "decisions":
+        return [f"Untagged evidence row: {o}" for o in _decision_orphans(content)]
+    if area == "hypotheses":
+        return [f"Untagged evidence row: {o}" for o in _scan_body_orphans(content)]
+    return []
+
+
+def write_brain_file(rel_path: str, content: str) -> dict:
+    """Write a brain file from the UI editor. Guards: must stay inside the brain, `.md` only,
+    and `source/` is read-only (verbatim audit anchors). Decisions/hypotheses get provenance
+    *warnings* but still save. Creates parent dirs, so a brand-new file just works. Returns
+    {ok, path, warnings} or {ok: False, error}."""
+    rel = (rel_path or "").strip().lstrip("/")
+    if not rel:
+        return {"ok": False, "error": "A file path is required."}
+    target = _safe_target(rel)
+    if target is None:
+        return {"ok": False, "error": "Path must be inside the PM Brain."}
+    if target.suffix != ".md":
+        return {"ok": False, "error": "Only .md files can be edited."}
+    if next(iter(Path(rel).parts), "") == "source":
+        return {"ok": False, "error": "source/ holds verbatim audit anchors and is read-only."}
+    _write(target, content)
+    return {"ok": True, "path": _rel(target), "warnings": file_warnings(rel, content)}
+
+
+def brain_files() -> dict:
+    """Every markdown file in the brain, grouped by area (root-level docs first), each with its
+    title and last-modified time, and whether the group is editable. Pure read — the dashboard's
+    browse-everything surface, beyond the curated slices in brain_status()."""
+    root = _brain_root()
+    out: dict = {"root": str(root), "exists": (root / "INDEX.md").exists(), "groups": []}
+    if not root.exists():
+        return out
+    grouped: list[tuple[str, list[Path]]] = []
+    top = sorted(root.glob("*.md"))
+    if top:
+        grouped.append(("(root)", top))
+    for area in AREAS:
+        d = root / area
+        if d.exists():
+            files = sorted(d.rglob("*.md"))
+            if files:
+                grouped.append((area, files))
+    for area, files in grouped:
+        out["groups"].append(
+            {
+                "area": area,
+                "editable": area != "source",
+                "files": [
+                    {"path": _rel(f), "title": _title_of(f), "mtime": f.stat().st_mtime}
+                    for f in files
+                ],
+            }
+        )
+    return out
+
+
 # ── scaffold templates (the deterministic structure, condensed from pm-brain) ─────
 
 _INDEX = """# PM Brain — Master Index
