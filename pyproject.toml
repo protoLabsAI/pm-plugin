@@ -12,3 +12,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 extend-select = ["I"]
+
+[tool.pytest.ini_options]
+markers = [
+  "screenshot: browser-driven screenshot/render tests (needs Playwright + chromium; run via `pytest -m screenshot`)",
+]

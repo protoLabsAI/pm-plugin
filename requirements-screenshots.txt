@@ -1,0 +1,5 @@
+# Extra deps for the browser-driven screenshot tests (`pytest -m screenshot`). Not needed for the
+# fast unit suite. CI installs these in the dedicated `screenshots` job, then runs
+# `python -m playwright install --with-deps chromium` to fetch the browser.
+playwright>=1.40
+uvicorn>=0.27

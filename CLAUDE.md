@@ -16,13 +16,19 @@ full feature surface.
 
 ```bash
 pip install -r requirements-dev.txt   # test/lint deps (host deps are not installed here)
-pytest -q                             # full suite (host-free)
+pytest -q -m "not screenshot"         # fast host-free suite (no browser)
 pytest -q tests/test_pm.py::<name>    # a single test
 ruff check . && ruff format --check . # lint + format check (line-length 100, py311, isort via "I")
 ruff format .                         # apply formatting
+
+# Browser-driven screenshot/render tests (tests/test_screenshots.py, marked `screenshot`):
+pip install -r requirements-screenshots.txt && python -m playwright install chromium
+pytest -q -m screenshot               # renders the iframe in headless chromium → artifacts/screenshots/
 ```
 
-CI (`.github/workflows`) runs exactly `ruff check . && ruff format --check .` then `pytest -q`.
+A plain `pytest -q` also collects the screenshot tests but they skip cleanly when Playwright /
+chromium isn't installed. CI has two jobs: **test** (`ruff` + `pytest -q -m "not screenshot"`) and
+**screenshots** (installs chromium, runs `pytest -q -m screenshot`, uploads the PNGs as an artifact).
 
 ## Architecture
 

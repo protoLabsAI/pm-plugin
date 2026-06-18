@@ -26,4 +26,31 @@ jobs:
         run: ruff check . && ruff format --check .
 
       - name: Test
-        run: pytest -q
+        run: pytest -q -m "not screenshot"   # fast suite; browser tests run in the screenshots job
+
+  screenshots:
+    runs-on: ${{ vars.NSC_RUNNER || 'namespace-profile-protolabs-linux' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements-dev.txt -r requirements-screenshots.txt
+
+      - name: Install chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Screenshot tests
+        run: pytest -q -m screenshot
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pm-brain-screenshots
+          path: artifacts/screenshots/
+          if-no-files-found: warn
