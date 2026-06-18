@@ -219,6 +219,108 @@ def test_list_get_search_and_traversal_guard():
     assert "weekly active teams" in brain.pm_search.invoke({"query": "weekly active"})
 
 
+# ── file browser + edit (read/edit-all-docs surface) ────────────────────────────
+
+
+def test_brain_files_groups_everything_and_marks_source_read_only():
+    brain.pm_brain_init.invoke({})
+    brain.pm_note.invoke({"area": "product/roadmap", "content": "Now: ship digest."})
+    brain.pm_ingest.invoke(
+        {
+            "kind": "interviews",
+            "title": "Acme",
+            "synthesis": "x",
+            "source_text": "verbatim transcript",
+        }
+    )
+    f = brain.brain_files()
+    assert f["exists"] is True
+    areas = {g["area"]: g for g in f["groups"]}
+    # root-level docs (INDEX, operating-manual) surface under a "(root)" group, first
+    assert f["groups"][0]["area"] == "(root)"
+    assert any(x["path"] == "INDEX.md" for x in areas["(root)"]["files"])
+    # a knowledge file the curated status sweep never surfaces is browsable here
+    paths = {x["path"] for g in f["groups"] for x in g["files"]}
+    assert "knowledge/product/roadmap.md" in paths
+    # source/ is present but flagged read-only; every other group is editable
+    assert areas["source"]["editable"] is False
+    assert areas["knowledge"]["editable"] is True
+    # each file carries a human title pulled from its first heading
+    roadmap = next(x for x in areas["knowledge"]["files"] if x["path"].endswith("roadmap.md"))
+    assert roadmap["title"] and "mtime" in roadmap
+
+
+def test_write_brain_file_creates_new_file_with_parent_dirs():
+    brain.pm_brain_init.invoke({})
+    res = brain.write_brain_file("knowledge/product/pricing.md", "# Pricing\n\nFlat tier.\n")
+    assert res["ok"] is True and res["warnings"] == []
+    assert (brain._brain_root() / "knowledge" / "product" / "pricing.md").exists()
+
+
+def test_write_brain_file_guards_traversal_extension_and_source():
+    brain.pm_brain_init.invoke({})
+    assert brain.write_brain_file("../../etc/passwd", "x")["ok"] is False
+    assert "inside" in brain.write_brain_file("../../etc/passwd.md", "x")["error"]
+    assert brain.write_brain_file("knowledge/notes.txt", "x")["ok"] is False
+    src = brain.write_brain_file("source/interviews/2026-06-16-acme.md", "tampered")
+    assert src["ok"] is False and "read-only" in src["error"]
+
+
+def test_write_brain_file_warns_on_untagged_decision_but_saves():
+    brain.pm_brain_init.invoke({})
+    body = "# Decision: ship\n\n## Status\npending\n\n## Evidence\n- users want it\n"  # untagged
+    res = brain.write_brain_file("decisions/2026-06-16-ship.md", body)
+    assert res["ok"] is True  # warn, don't block
+    assert res["warnings"] and "users want it" in res["warnings"][0]
+    assert (brain._brain_root() / "decisions" / "2026-06-16-ship.md").read_text() == body
+    # a properly tagged row produces no warning
+    ok = brain.write_brain_file(
+        "decisions/2026-06-16-ship.md",
+        "# Decision: ship\n\n## Evidence\n- users want it  (intuition, PM, 2026-06-16)\n",
+    )
+    assert ok["ok"] is True and ok["warnings"] == []
+
+
+def test_write_brain_file_detects_stale_edit_conflict():
+    brain.pm_brain_init.invoke({})
+    r1 = brain.write_brain_file("knowledge/x.md", "# X\nv1\n")
+    assert r1["ok"] is True and "mtime" in r1
+    # a matching mtime saves fine
+    ok = brain.write_brain_file("knowledge/x.md", "# X\nv2\n", expected_mtime=r1["mtime"])
+    assert ok["ok"] is True
+    # a stale (older) mtime is refused as a conflict, leaving the file untouched
+    stale = brain.write_brain_file("knowledge/x.md", "# X\nv3\n", expected_mtime=r1["mtime"] - 100)
+    assert stale["ok"] is False and stale.get("conflict") is True
+    assert (brain._brain_root() / "knowledge" / "x.md").read_text() == "# X\nv2\n"
+
+
+def test_write_brain_file_rejects_unknown_area():
+    brain.pm_brain_init.invoke({})
+    bad = brain.write_brain_file("competitors/acme.md", "# Acme\n")
+    assert bad["ok"] is False and "area" in bad["error"].lower()
+    # a root-level doc and a known area both save (matches what the UI offers)
+    assert brain.write_brain_file("notes.md", "# Notes\n")["ok"] is True
+    assert brain.write_brain_file("knowledge/ok.md", "# OK\n")["ok"] is True
+
+
+def test_write_brain_file_must_be_new_refuses_existing():
+    brain.pm_brain_init.invoke({})
+    brain.write_brain_file("knowledge/dup.md", "# Dup\nv1\n")
+    res = brain.write_brain_file("knowledge/dup.md", "# Dup\nv2\n", must_be_new=True)
+    assert res["ok"] is False and res.get("conflict") is True
+    assert (brain._brain_root() / "knowledge" / "dup.md").read_text() == "# Dup\nv1\n"
+    # must_be_new on a genuinely new path still saves
+    assert brain.write_brain_file("knowledge/fresh.md", "# Fresh\n", must_be_new=True)["ok"] is True
+
+
+def test_title_of_uses_first_nonempty_line():
+    brain.pm_brain_init.invoke({})
+    brain.write_brain_file("knowledge/z.md", "\n\n# Heading Z\n\nbody\n")
+    f = brain.brain_files()
+    z = next(x for g in f["groups"] for x in g["files"] if x["path"].endswith("z.md"))
+    assert z["title"] == "Heading Z"
+
+
 # ── register() wiring ───────────────────────────────────────────────────────────
 
 
@@ -321,6 +423,88 @@ def test_view_status_and_file_routes_reflect_the_brain():
     assert c.get("/api/plugins/pm/file", params={"path": "../../etc/passwd"}).status_code == 400
 
 
+def test_files_route_lists_all_brain_docs():
+    from fastapi.testclient import TestClient
+
+    brain.pm_brain_init.invoke({})
+    brain.pm_note.invoke({"area": "product/roadmap", "content": "Now: ship digest."})
+    c = TestClient(_app())
+    f = c.get("/api/plugins/pm/files").json()
+    assert f["exists"] is True
+    paths = {x["path"] for g in f["groups"] for x in g["files"]}
+    assert "INDEX.md" in paths and "knowledge/product/roadmap.md" in paths
+
+
+def test_put_file_route_saves_creates_and_guards():
+    from fastapi.testclient import TestClient
+
+    brain.pm_brain_init.invoke({})
+    c = TestClient(_app())
+    # create a brand-new file through the editor route
+    r = c.put(
+        "/api/plugins/pm/file", json={"path": "knowledge/notes.md", "content": "# Notes\nhi\n"}
+    )
+    assert r.status_code == 200 and r.json()["warnings"] == []
+    got = c.get("/api/plugins/pm/file", params={"path": "knowledge/notes.md"}).json()
+    assert "hi" in got["content"]
+    # source/ is read-only, traversal is refused — both 400
+    assert (
+        c.put("/api/plugins/pm/file", json={"path": "source/x.md", "content": "tamper"}).status_code
+        == 400
+    )
+    assert (
+        c.put(
+            "/api/plugins/pm/file", json={"path": "../../etc/passwd.md", "content": "x"}
+        ).status_code
+        == 400
+    )
+    # an untagged decision still saves (warn, don't block) but reports the warning
+    w = c.put(
+        "/api/plugins/pm/file",
+        json={"path": "decisions/2026-06-16-x.md", "content": "## Evidence\n- nope\n"},
+    )
+    assert w.status_code == 200 and w.json()["warnings"]
+
+
+def test_put_file_route_flags_stale_edit_as_409():
+    from fastapi.testclient import TestClient
+
+    brain.pm_brain_init.invoke({})
+    c = TestClient(_app())
+    c.put("/api/plugins/pm/file", json={"path": "knowledge/y.md", "content": "# Y\nv1\n"})
+    got = c.get("/api/plugins/pm/file", params={"path": "knowledge/y.md"}).json()
+    assert "mtime" in got
+    # a stale mtime → 409 conflict, not a silent overwrite
+    stale = c.put(
+        "/api/plugins/pm/file",
+        json={"path": "knowledge/y.md", "content": "# Y\nv2\n", "mtime": got["mtime"] - 100},
+    )
+    assert stale.status_code == 409
+    # the matching mtime saves and returns the fresh mtime
+    ok = c.put(
+        "/api/plugins/pm/file",
+        json={"path": "knowledge/y.md", "content": "# Y\nv2\n", "mtime": got["mtime"]},
+    )
+    assert ok.status_code == 200 and "mtime" in ok.json()
+
+
+def test_put_file_route_new_flag_refuses_existing_file():
+    from fastapi.testclient import TestClient
+
+    brain.pm_brain_init.invoke({})
+    c = TestClient(_app())
+    c.put("/api/plugins/pm/file", json={"path": "knowledge/n.md", "content": "# N\nv1\n"})
+    # creating with new=True over an existing path is refused (409), not overwritten
+    r = c.put(
+        "/api/plugins/pm/file",
+        json={"path": "knowledge/n.md", "content": "clobber", "new": True},
+    )
+    assert r.status_code == 409
+    assert (
+        "v1" in c.get("/api/plugins/pm/file", params={"path": "knowledge/n.md"}).json()["content"]
+    )
+
+
 def test_shell_page_is_four_rules_compliant():
     from pm import view
 
@@ -330,3 +514,28 @@ def test_shell_page_is_four_rules_compliant():
     assert 'apiFetch("/api/plugins/pm/status")' in html  # gated data via the kit
     assert "kit.initPluginView" in html  # kit owns theming
     assert ":root{" not in html[: html.index("</style>")]  # no hand-rolled theme
+
+
+def test_shell_page_has_browser_and_editor_surface():
+    from pm import view
+
+    html = view._SHELL_HTML
+    assert 'apiFetch("/api/plugins/pm/files")' in html  # browse-everything index
+    assert '"/api/plugins/pm/file"' in html and 'method:"PUT"' in html  # save route
+    assert 'id="ptext"' in html and 'id="psave"' in html  # editor textarea + save
+    assert 'id="newform"' in html  # create-new-file affordance
+
+
+def test_shell_page_renders_rows_without_interpolating_user_data():
+    from pm import view
+
+    html = view._SHELL_HTML
+    # user-controlled values go into the DOM via textContent/setAttribute, never an HTML string
+    assert "hydrateRows" in html
+    assert 'setAttribute("data-path"' in html
+    assert "textContent=r.label" in html
+    # the old, injection-prone pattern is gone
+    assert "data-path=\"'+esc(path)" not in html
+    # dashboard fetches run in parallel, and a new file can't silently overwrite an existing one
+    assert "Promise.all" in html
+    assert "new:cur.isNew" in html
