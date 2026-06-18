@@ -109,8 +109,14 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     font-family:var(--pl-font-mono,ui-monospace,Menlo,monospace);overflow:hidden;text-overflow:ellipsis;max-width:50%}
   #body{flex:1;min-height:0;display:flex}
   #cols{flex:1;min-width:0;overflow:auto;padding:14px;display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;align-content:start}
-  .card{border:1px solid var(--pl-color-border,#2a2a30);border-radius:8px;padding:12px 14px;background:rgba(127,127,127,.05)}
+    grid-template-columns:repeat(var(--pm-ncols,3),minmax(0,1fr));gap:14px;align-content:start}
+  .card{position:relative;border:1px solid var(--pl-color-border,#2a2a30);border-radius:8px;padding:12px 14px;background:rgba(127,127,127,.05)}
+  .card.dragging{opacity:.45}
+  .cardgrip{position:absolute;top:7px;right:13px;cursor:grab;color:var(--pl-color-fg-muted,#9aa0aa);
+    font-size:11px;letter-spacing:-2px;line-height:1;opacity:.4;user-select:none;-webkit-user-select:none}
+  .cardgrip:hover{opacity:1}
+  .cardresize{position:absolute;top:0;right:0;width:9px;height:100%;cursor:col-resize;border-radius:0 8px 8px 0}
+  .cardresize:hover{background:linear-gradient(to right,transparent,rgba(127,127,127,.28))}
   .card h2{font-size:12px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.04em;color:var(--pl-color-fg-muted,#9aa0aa)}
   .row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;cursor:pointer;border-radius:4px}
   .row:hover{background:rgba(127,127,127,.10)}
@@ -131,8 +137,12 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   #newform select,#newform input{background:var(--pl-color-bg,#0a0a0c);color:var(--pl-color-fg,#ededed);
     border:1px solid var(--pl-color-border,#2a2a30);border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit}
   #newform input{width:200px}
+  #pgrip{flex:0 0 0;cursor:col-resize;background:transparent}
+  #body.panelopen #pgrip{flex-basis:6px}
+  #body.panelopen #pgrip:hover{background:var(--pl-color-border,#2a2a30)}
   #panel{width:0;flex-shrink:0;border-left:1px solid var(--pl-color-border,#2a2a30);overflow:auto;transition:width .12s;background:var(--pl-color-bg,#0a0a0c)}
   #panel.open{width:52%}
+  #panel.resizing{transition:none}
   #panel .ph{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--pl-color-border,#2a2a30);font-size:12px}
   #ptitle{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--pl-font-mono,ui-monospace,Menlo,monospace)}
   #panel .ph .sp{margin-left:auto}
@@ -177,6 +187,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   </div>
   <div id="body">
     <div id="cols"><div id="empty" style="display:none"></div></div>
+    <div id="pgrip" title="Drag to resize"></div>
     <div id="panel">
       <div class="ph">
         <span id="ptitle" class="muted"></span>
@@ -215,6 +226,108 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     try { return window.DOMPurify.sanitize(window.marked.parse(src||"", {gfm:true})); }
     catch(e){ return null; }  // any parser/sanitizer failure → caller falls back to raw
   }
+
+  // ── adjustable layout (mirrors the DS AppShell: drag-to-reorder + edge-resize, persisted) ──
+  // Cards reorder by dragging their grip, resize their column span by dragging the right edge,
+  // and the read-panel split is a draggable gutter. State persists to localStorage by card key.
+  var $body=document.getElementById("body"), $pgrip=document.getElementById("pgrip");
+  var LKEY="pm-brain:layout:v1", ncols=3;
+  function loadLayout(){ try{ return JSON.parse(localStorage.getItem(LKEY))||{}; }catch(e){ return {}; } }
+  function saveLayout(){ try{ localStorage.setItem(LKEY, JSON.stringify(LAYOUT)); }catch(e){} }
+  var LAYOUT=loadLayout();  // { order:[key…], spans:{key:span}, panelw:"<n>px" }
+
+  // Read panel open/close also drives the split gutter + restores the saved width.
+  function panelOpen(){ $panel.classList.add("open"); $body.classList.add("panelopen");
+    $panel.style.width = LAYOUT.panelw || ""; }            // "" → CSS .open default (52%)
+  function panelClose(){ $panel.classList.remove("open"); $body.classList.remove("panelopen");
+    $panel.style.width = ""; }                              // clear inline px so width:0 applies
+
+  function computeCols(){
+    var w=$cols.clientWidth||$cols.offsetWidth||0;
+    ncols=Math.max(1, Math.min(4, Math.floor((w+14)/(300+14))||1));   // ~300px tracks, 1..4
+    $cols.style.setProperty("--pm-ncols", ncols);
+  }
+  function clampSpans(){
+    $cols.querySelectorAll(".card").forEach(function(c){
+      var s=LAYOUT.spans && LAYOUT.spans[c.getAttribute("data-key")];
+      c.style.gridColumn = s ? ("span "+Math.max(1,Math.min(ncols,s))) : "";  // "" → CSS default
+    });
+  }
+  function applyLayout(){
+    var cards=[].slice.call($cols.querySelectorAll(".card"));
+    if(!cards.length) return;
+    var byKey={}; cards.forEach(function(c){ byKey[c.getAttribute("data-key")]=c; });
+    var order=(LAYOUT.order||[]).filter(function(k){ return byKey[k]; });    // saved, still-present
+    cards.forEach(function(c){ var k=c.getAttribute("data-key"); if(k && order.indexOf(k)<0) order.push(k); });
+    order.forEach(function(k){ $cols.appendChild(byKey[k]); });             // saved order, new cards last
+    clampSpans();
+  }
+  function persistOrder(){
+    LAYOUT.order=[].map.call($cols.querySelectorAll(".card"), function(c){ return c.getAttribute("data-key"); });
+    saveLayout();
+  }
+  function persistSpan(key, span){ (LAYOUT.spans=LAYOUT.spans||{})[key]=span; saveLayout(); }
+
+  // Drop target = the card the dragged one inserts before (null → append): nearest center, side-aware.
+  function dropTarget(x, y){
+    var cards=[].slice.call($cols.querySelectorAll(".card:not(.dragging)"));
+    var best=null, bestD=Infinity, after=false;
+    cards.forEach(function(c){ var r=c.getBoundingClientRect(), cx=r.left+r.width/2, cy=r.top+r.height/2;
+      var d=Math.hypot(x-cx, y-cy); if(d<bestD){ bestD=d; best=c; after=(x>cx); } });
+    if(!best) return null;
+    return after ? best.nextElementSibling : best;
+  }
+  function wireResize(c, handle){
+    handle.addEventListener("pointerdown", function(e){
+      e.preventDefault(); e.stopPropagation();
+      try{ handle.setPointerCapture(e.pointerId); }catch(_){}
+      function move(ev){
+        var grid=$cols.getBoundingClientRect(), gap=14, col=(grid.width-(ncols-1)*gap)/ncols;
+        var left=c.getBoundingClientRect().left;
+        var span=Math.max(1, Math.min(ncols, Math.round((ev.clientX-left+gap)/(col+gap))));
+        c.style.gridColumn="span "+span; c._span=span;
+      }
+      function up(){ document.removeEventListener("pointermove",move); document.removeEventListener("pointerup",up);
+        if(c._span) persistSpan(c.getAttribute("data-key"), c._span); }
+      document.addEventListener("pointermove",move); document.addEventListener("pointerup",up);
+    });
+  }
+  function wireCards(){
+    $cols.querySelectorAll(".card").forEach(function(c){
+      var grip=c.querySelector(".cardgrip"), rez=c.querySelector(".cardresize");
+      if(grip && !grip._w){ grip._w=1;
+        // native DnD: arm draggable only while the grip is held, so row clicks stay unaffected.
+        grip.addEventListener("mousedown", function(){ c.setAttribute("draggable","true"); });
+        grip.addEventListener("mouseup", function(){ c.removeAttribute("draggable"); });
+        c.addEventListener("dragstart", function(e){ c.classList.add("dragging");
+          if(e.dataTransfer){ e.dataTransfer.effectAllowed="move"; try{ e.dataTransfer.setData("text/plain",""); }catch(_){} } });
+        c.addEventListener("dragend", function(){ c.classList.remove("dragging"); c.removeAttribute("draggable"); persistOrder(); });
+      }
+      if(rez && !rez._w){ rez._w=1; wireResize(c, rez); }
+    });
+    if(!$cols._dnd){ $cols._dnd=1;
+      $cols.addEventListener("dragover", function(e){
+        var d=$cols.querySelector(".card.dragging"); if(!d) return; e.preventDefault();
+        var t=dropTarget(e.clientX, e.clientY);
+        if(t!==d) $cols.insertBefore(d, t);   // t null → append to end
+      });
+    }
+  }
+  // Draggable read-panel split gutter.
+  $pgrip.addEventListener("pointerdown", function(e){
+    if(!$panel.classList.contains("open")) return;
+    e.preventDefault(); try{ $pgrip.setPointerCapture(e.pointerId); }catch(_){}
+    $panel.classList.add("resizing"); document.body.style.cursor="col-resize";
+    function move(ev){
+      var b=$body.getBoundingClientRect(), w=Math.max(300, Math.min(b.width*0.8, b.right-ev.clientX));
+      $panel.style.width=w+"px"; LAYOUT.panelw=w+"px";
+    }
+    function up(){ $panel.classList.remove("resizing"); document.body.style.cursor="";
+      document.removeEventListener("pointermove",move); document.removeEventListener("pointerup",up); saveLayout(); }
+    document.addEventListener("pointermove",move); document.addEventListener("pointerup",up);
+  });
+  // Re-clamp spans when the cards area changes width (panel resize / open-close / window).
+  if(window.ResizeObserver){ new ResizeObserver(function(){ computeCols(); clampSpans(); }).observe($cols); }
   // Areas a human PM can author into from the UI (source/ is read-only audit anchors).
   var NEW_AREAS=["knowledge","decisions","hypotheses","stakeholders","ingestion","rules","maintenance","(root)"];
   $narea.innerHTML=NEW_AREAS.map(function(a){ return '<option value="'+a+'">'+a+'</option>'; }).join("");
@@ -254,13 +367,13 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   function showFile(path, editable, content, isNew, mtime){
     cur={path:path, editable:editable, content:content, isNew:!!isNew,
          mtime:(mtime==null?null:mtime), force:false};
-    $panel.classList.add("open"); $ptitle.textContent=path; $ptitle.classList.remove("muted");
+    panelOpen(); $ptitle.textContent=path; $ptitle.classList.remove("muted");
     $pro.style.display=editable?"none":""; note("");
     markActive(path);
     if(isNew) editMode(); else viewMode();
   }
   async function openFile(path, editable){
-    $panel.classList.add("open"); $ptitle.textContent=path; $pbody.textContent="Loading…";
+    panelOpen(); $ptitle.textContent=path; $pbody.textContent="Loading…";
     $pbody.style.display="block"; $prender.style.display="none"; $ptext.style.display="none"; note("");
     $pedit.style.display="none"; $psave.style.display="none"; $pcancel.style.display="none";
     $pro.style.display="none"; $praw.style.display="none";
@@ -296,7 +409,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     }catch(e){ note("Could not save (network).", "bad"); }
   }
   $pedit.addEventListener("click", editMode);
-  $pcancel.addEventListener("click", function(){ if(cur.isNew){ $panel.classList.remove("open"); } else { note(""); viewMode(); } });
+  $pcancel.addEventListener("click", function(){ if(cur.isNew){ panelClose(); } else { note(""); viewMode(); } });
   $psave.addEventListener("click", save);
   $praw.addEventListener("click", function(){ rawView=!rawView; paintBody(); });
   // Links inside rendered markdown must not navigate the iframe. A brain-relative *.md link
@@ -314,7 +427,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     var target=segs.join("/");
     if(target) openFile(target, target.split("/")[0]!=="source");  // source/ stays read-only
   });
-  document.getElementById("pclose").addEventListener("click", function(){ $panel.classList.remove("open"); markActive(null); });
+  document.getElementById("pclose").addEventListener("click", function(){ panelClose(); markActive(null); });
 
   function markActive(path){
     $cols.querySelectorAll(".row.active").forEach(function(el){ el.classList.remove("active"); });
@@ -335,7 +448,11 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   $nname.addEventListener("keydown", function(e){ if(e.key==="Enter") document.getElementById("ncreate").click(); });
 
   // ── dashboard cards + file browser ──
-  function card(title, inner, cls){ return '<div class="card'+(cls?' '+cls:'')+'"><h2>'+title+'</h2>'+inner+'</div>'; }
+  function card(title, inner, cls, key){
+    return '<div class="card'+(cls?' '+cls:'')+'"'+(key?' data-key="'+key+'"':'')
+      +'><span class="cardgrip" title="Drag to reorder">⋮⋮</span><h2>'+title+'</h2>'+inner
+      +'<span class="cardresize" title="Drag to resize width"></span></div>';
+  }
   // Rows carry user-controlled text (filenames, doc titles, stakeholder names). Never interpolate
   // those into an HTML string — stash them and write them into the DOM via textContent/setAttribute
   // after the card shells exist (hydrateRows), so a crafted filename can't inject markup.
@@ -362,7 +479,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       var rows=g.files.map(function(x){ return fileRow(x.path, x.title||x.path, g.editable?"":"read-only", g.editable); }).join("");
       return '<div class="grp"><div class="grphead">'+esc(g.area)+' <span class="muted">· '+g.files.length+'</span></div>'+rows+'</div>';
     }).join("");
-    return card('All files &nbsp;<span class="pill ok">'+total+'</span>', inner, "files");
+    return card('All files &nbsp;<span class="pill ok">'+total+'</span>', inner, "files", "files");
   }
 
   function render(s, f){
@@ -384,28 +501,29 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     var pend = d.pending.map(function(p){ return fileRow(p.file, p.title, "pending"); }).join("") || '<div class="muted">No open decisions. </div>';
     html += card('Decision debt &nbsp;<span class="pill '+(d.pending.length?'warn':'ok')+'">'+d.pending.length+'</span>',
       pend + '<div class="stat" style="margin-top:8px"><span>decided</span><b>'+d.decided+'</b></div>'
-      +'<div class="stat"><span>superseded</span><b>'+d.superseded+'</b></div>');
+      +'<div class="stat"><span>superseded</span><b>'+d.superseded+'</b></div>', null, "decisions");
 
     // Hypotheses
     var chips = Object.keys(h.by_status).map(function(k){ return '<span class="chip">'+k+' · '+h.by_status[k]+'</span>'; }).join("") || '<span class="muted">none</span>';
     var feats = h.features.slice(0,8).map(function(f){ return fileRow(f.file, f.file.replace("hypotheses/",""), f.status); }).join("");
-    html += card('Hypotheses', chips + (feats?('<div style="margin-top:6px">'+feats+'</div>'):''));
+    html += card('Hypotheses', chips + (feats?('<div style="margin-top:6px">'+feats+'</div>'):''), null, "hypotheses");
 
     // Stakeholders
     var stale = st.stale.map(function(x){ return fileRow(x.file, x.name, x.last); }).join("") || '<div class="muted">All current. </div>';
-    html += card('Stale stakeholders &nbsp;<span class="pill '+(st.stale.length?'warn':'ok')+'">'+st.stale.length+'/'+st.total+'</span>', stale);
+    html += card('Stale stakeholders &nbsp;<span class="pill '+(st.stale.length?'warn':'ok')+'">'+st.stale.length+'/'+st.total+'</span>', stale, null, "stakeholders");
 
     // Recent ingestion
     if(s.ingestion_recent.length){
-      html += card('Recent ingestion', s.ingestion_recent.map(function(i){ return fileRow(i.file, i.title, ""); }).join(""));
+      html += card('Recent ingestion', s.ingestion_recent.map(function(i){ return fileRow(i.file, i.title, ""); }).join(""), null, "ingestion");
     }
 
     // Counts
     var counts = Object.keys(s.counts).map(function(k){ return '<div class="stat"><span>'+k+'</span><b>'+s.counts[k]+'</b></div>'; }).join("");
-    html += card('Areas', counts);
+    html += card('Areas', counts, null, "areas");
 
     $cols.innerHTML=html;
     hydrateRows();
+    computeCols(); applyLayout(); wireCards();
     if(cur.path) markActive(cur.path);
   }
 
