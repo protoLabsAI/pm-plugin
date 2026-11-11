@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dev deps
-        run: pip install -r requirements-dev.txt ruff
+        run: pip install -r requirements-dev.txt "ruff==0.15.20"
 
       - name: Lint
         run: ruff check . && ruff format --check .
